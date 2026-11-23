@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from app import service
-from app.models import Base, UserConfig, fmt_ts, make_engine
+from app.models import Base, UserConfig, decode_event_ids, fmt_ts, make_engine, run_migrations
 from app.schemas import (
     ChangeOut,
     EventOut,
@@ -29,6 +29,7 @@ from app.service import ApiError
 
 engine = make_engine()
 Base.metadata.create_all(engine)
+run_migrations(engine)
 
 app = FastAPI(
     title="Event Session Publishing Service",
@@ -56,6 +57,7 @@ def _session_from_dict(sess: dict) -> SessionOut:
         end_time=fmt_ts(sess["end"]),
         event_count=len(sess["event_ids"]),
         event_ids=sess["event_ids"],
+        ids_need_review=sess.get("ids_need_review", False),
         status=sess["status"],
     )
 
@@ -70,14 +72,19 @@ def _change_out(change_type: str, item) -> ChangeOut:
             end_time=fmt_ts(item["end"]),
             event_count=len(item["event_ids"]),
             event_ids=item["event_ids"],
+            ids_need_review=item.get("ids_need_review", False),
         )
+    ids, need_review = decode_event_ids(
+        item.event_ids, item.event_count, item.id_encoding
+    )
     return ChangeOut(
         change_type=change_type,  # type: ignore[arg-type]
         session_key=item.session_key,
         start_time=fmt_ts(item.start_time),
         end_time=fmt_ts(item.end_time),
         event_count=item.event_count,
-        event_ids=item.event_ids.split(","),
+        event_ids=ids,
+        ids_need_review=need_review,
     )
 
 

@@ -8,6 +8,7 @@ so the previous revision remains the latest visible one.
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from datetime import datetime, timedelta
 
@@ -17,11 +18,14 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     EPOCH,
+    ENCODING_JSON,
     Event,
     Revision,
     RevisionChange,
     SessionSnapshot,
     UserConfig,
+    decode_event_ids,
+    encode_event_ids,
     to_utc,
 )
 
@@ -71,6 +75,20 @@ def set_idle_gap(db: Session, user_id: str, idle_gap_seconds: int) -> UserConfig
 
 
 def _session_key(event_ids: list[str]) -> str:
+    """Collision-free key for one user's sessions.
+
+    The key is derived from the canonical JSON array of the ordered event
+    ids, not from a comma-joined string. That keeps a single-event session
+    whose id is ``"a,b"`` distinct from a two-event session
+    ``["a", "b"]`` — they shared one key under the old rule, which could
+    suppress a publish and corrupt reads.
+    """
+    payload = json.dumps(event_ids, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _legacy_session_key(event_ids: list[str]) -> str:
+    """The key the pre-upgrade code would have computed (migration only)."""
     digest = hashlib.sha256(",".join(event_ids).encode("utf-8")).hexdigest()
     return digest[:16]
 
@@ -91,6 +109,7 @@ def sessionize(events: list[Event], idle_gap_seconds: int) -> list[dict]:
         if current is None or ev.event_time - current["end"] > gap:
             current = {
                 "session_key": "",
+                "legacy_key": "",
                 "start": ev.event_time,
                 "end": ev.event_time,
                 "event_ids": [ev.event_id],
@@ -102,6 +121,7 @@ def sessionize(events: list[Event], idle_gap_seconds: int) -> list[dict]:
 
     for sess in sessions:
         sess["session_key"] = _session_key(sess["event_ids"])
+        sess["legacy_key"] = _legacy_session_key(sess["event_ids"])
     return sessions
 
 
@@ -148,24 +168,82 @@ def list_revisions(db: Session, user_id: str) -> list[Revision]:
     )
 
 
-def _published_map(snapshots) -> dict[str, SessionSnapshot]:
-    return {s.session_key: s for s in snapshots if s.status == "published"}
-
-
 def _diff_published(
-    old_published: dict[str, SessionSnapshot], new_sessions: list[dict]
+    prev: Revision | None, new_sessions: list[dict]
 ) -> tuple[list, list]:
-    """Return (retractions, additions) against the previously published set."""
-    new_published = {s["session_key"]: s for s in new_sessions if s["status"] == "published"}
+    """Diff the previously published set against the recomputed sessions.
 
-    retractions = [
-        old_published[key]
-        for key in sorted(set(old_published) - set(new_published))
-    ]
-    additions = [
-        new_published[key]
-        for key in sorted(set(new_published) - set(old_published))
-    ]
+    Returns ``(retractions, additions)`` and rewrites each newly published
+    session's effective ``session_key`` in place.
+
+    Migration rules for a pre-upgrade database:
+
+    * a legacy published key whose stored ids cannot be split back to the
+      recorded event count is flagged for review and retracted **once per
+      key**; sessions that would have used that key under the old rule and
+      are still eligible are re-published under new-style keys;
+    * unchanged sessions keep their original (old-style) key so they are not
+      retracted/re-published just because of the key-scheme change;
+    * everything else gets the collision-free new-style key.
+    """
+    new_published = [s for s in new_sessions if s["status"] == "published"]
+
+    if prev is None:
+        return [], list(new_published)
+
+    old_snaps = [s for s in prev.sessions if s.status == "published"]
+    retractions: list[SessionSnapshot] = []
+    additions: list[dict] = []
+    retracted_keys: set[str] = set()
+    consumed: set[int] = set()
+
+    def _flagged(snap: SessionSnapshot) -> bool:
+        _ids, need_review = decode_event_ids(
+            snap.event_ids, snap.event_count, snap.id_encoding
+        )
+        return need_review
+
+    # Pass 1: ambiguous legacy keys are always retracted, each only once.
+    for snap in old_snaps:
+        if _flagged(snap) and snap.session_key not in retracted_keys:
+            retracted_keys.add(snap.session_key)
+            retractions.append(snap)
+
+    # Pass 2: intact old keys — keep them when the identical session still
+    # publishes, otherwise retract (again, once per key).
+    for snap in old_snaps:
+        if _flagged(snap) or snap.session_key in retracted_keys:
+            continue
+        old_ids, _review = decode_event_ids(
+            snap.event_ids, snap.event_count, snap.id_encoding
+        )
+        match_idx = next(
+            (
+                i
+                for i, cand in enumerate(new_published)
+                if i not in consumed
+                and cand["event_ids"] == old_ids
+                and snap.session_key
+                in (cand["session_key"], cand["legacy_key"])
+            ),
+            None,
+        )
+        if match_idx is not None:
+            # Identical content survives the upgrade: keep its original key.
+            consumed.add(match_idx)
+            new_published[match_idx]["session_key"] = snap.session_key
+        elif snap.session_key not in retracted_keys:
+            retracted_keys.add(snap.session_key)
+            retractions.append(snap)
+
+    # Pass 3: every published session not bound to an intact old row is new
+    # (including sessions that used an ambiguous legacy key) and keeps the
+    # new-style collision-free key it was computed with.
+    for i, sess in enumerate(new_published):
+        if i not in consumed:
+            additions.append(sess)
+
+    retractions.sort(key=lambda s: s.session_key)
     return retractions, additions
 
 
@@ -208,7 +286,8 @@ def _persist_revision(
                 start_time=sess["start"],
                 end_time=sess["end"],
                 event_count=len(sess["event_ids"]),
-                event_ids=",".join(sess["event_ids"]),
+                event_ids=encode_event_ids(sess["event_ids"]),
+                id_encoding=ENCODING_JSON,
                 status=sess["status"],
             )
         )
@@ -223,6 +302,7 @@ def _persist_revision(
                 end_time=snap.end_time,
                 event_count=snap.event_count,
                 event_ids=snap.event_ids,
+                id_encoding=snap.id_encoding,
             )
         )
     for sess in additions:
@@ -234,7 +314,8 @@ def _persist_revision(
                 start_time=sess["start"],
                 end_time=sess["end"],
                 event_count=len(sess["event_ids"]),
-                event_ids=",".join(sess["event_ids"]),
+                event_ids=encode_event_ids(sess["event_ids"]),
+                id_encoding=ENCODING_JSON,
             )
         )
 
@@ -276,11 +357,15 @@ def _state_dicts(
 
 
 def _snap_to_dict(snap: SessionSnapshot) -> dict:
+    ids, need_review = decode_event_ids(
+        snap.event_ids, snap.event_count, snap.id_encoding
+    )
     return {
         "session_key": snap.session_key,
         "start": snap.start_time,
         "end": snap.end_time,
-        "event_ids": snap.event_ids.split(","),
+        "event_ids": ids,
+        "ids_need_review": need_review,
         "status": snap.status,
     }
 
@@ -385,8 +470,7 @@ def import_events(
     )
 
     prev = latest_revision(db, user_id)
-    old_published = _published_map(prev.sessions) if prev else {}
-    retractions, additions = _diff_published(old_published, new_sessions)
+    retractions, additions = _diff_published(prev, new_sessions)
 
     new_rev_no: int | None = None
     if retractions or additions:
@@ -465,8 +549,7 @@ def advance_watermark(
     )
 
     prev = latest_revision(db, user_id)
-    old_published = _published_map(prev.sessions) if prev else {}
-    retractions, additions = _diff_published(old_published, new_sessions)
+    retractions, additions = _diff_published(prev, new_sessions)
 
     new_rev_no: int | None = None
     if retractions or additions:

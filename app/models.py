@@ -6,6 +6,7 @@ ordering in SQLite.
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 
@@ -17,6 +18,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -66,6 +69,66 @@ def parse_ts(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
         tzinfo=timezone.utc
     )
+
+
+# How the event_ids column is serialized.
+#   "json"     -> new format: a JSON array of full, ordered event ids
+#   "legacy_csv" -> old format: ids joined with "," (ambiguous when an id
+#                   itself contains a comma)
+ENCODING_JSON = "json"
+ENCODING_LEGACY_CSV = "legacy_csv"
+
+
+def encode_event_ids(event_ids: list[str]) -> str:
+    """Unambiguous serialization preserving order and every full id."""
+    return json.dumps(event_ids, ensure_ascii=False, separators=(",", ":"))
+
+
+def decode_event_ids(raw: str, event_count: int, encoding: str | None) -> tuple[list[str], bool]:
+    """Read stored event ids back.
+
+    Returns ``(ids, need_review)``. For legacy comma-separated rows whose
+    split count does not match the recorded event count (e.g. an old single
+    event whose id itself contains a comma), the id list is returned empty
+    and the row is flagged ``need_review`` so callers can surface it.
+    """
+    encoding = encoding or ENCODING_LEGACY_CSV
+    if encoding == ENCODING_JSON:
+        try:
+            ids = json.loads(raw)
+        except (ValueError, TypeError):
+            return [], True
+        if isinstance(ids, list) and all(isinstance(x, str) for x in ids):
+            return ids, False
+        return [], True
+    ids = raw.split(",")
+    if len(ids) != event_count:
+        return [], True
+    return ids, False
+
+
+def run_migrations(engine) -> None:
+    """Lightweight, additive schema migration for pre-existing databases.
+
+    Old databases keep their tables and data; we only add the id_encoding
+    column (absent on every pre-upgrade schema) and backfill every existing
+    row with the legacy marker, so history retains its original revision
+    numbers and session keys.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table in ("session_snapshot", "revision_change"):
+            if table not in existing_tables:
+                continue  # fresh database: create_all builds the full schema
+            columns = {col["name"] for col in inspector.get_columns(table)}
+            if "id_encoding" not in columns:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table} ADD COLUMN id_encoding "
+                        f"VARCHAR(16) NOT NULL DEFAULT '{ENCODING_LEGACY_CSV}'"
+                    )
+                )
 
 
 def default_db_url() -> str:
@@ -171,7 +234,10 @@ class SessionSnapshot(Base):
     start_time: Mapped[datetime] = mapped_column(TZDateTime, nullable=False)
     end_time: Mapped[datetime] = mapped_column(TZDateTime, nullable=False)
     event_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    event_ids: Mapped[str] = mapped_column(Text, nullable=False)  # comma separated
+    event_ids: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array (new) / comma separated (legacy)
+    id_encoding: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="json"
+    )
     status: Mapped[str] = mapped_column(String(16), nullable=False)  # published / pending
 
     revision: Mapped[Revision] = relationship(back_populates="sessions")
@@ -190,5 +256,8 @@ class RevisionChange(Base):
     end_time: Mapped[datetime] = mapped_column(TZDateTime, nullable=False)
     event_count: Mapped[int] = mapped_column(Integer, nullable=False)
     event_ids: Mapped[str] = mapped_column(Text, nullable=False)
+    id_encoding: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="json"
+    )
 
     revision: Mapped[Revision] = relationship(back_populates="changes")

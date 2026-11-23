@@ -42,6 +42,7 @@
   .badge.pending { background:rgba(224,169,62,.15); color:var(--amber); }
   .badge.retract { background:rgba(224,96,96,.15); color:var(--red); }
   .badge.add { background:rgba(63,191,127,.15); color:var(--green); }
+  .badge.review { background:rgba(224,96,96,.18); color:#ff9b9b; border:1px solid rgba(224,96,96,.45); }
   .badge.publish { background:rgba(91,141,239,.18); color:var(--accent); }
   .badge.late_import { background:rgba(224,169,62,.15); color:var(--amber); }
   .muted { color:var(--muted); }
@@ -142,6 +143,18 @@
     <button onclick="runFullDemo()">▶ 运行完整演示</button>
     <button class="ghost" onclick="document.getElementById('log').textContent=''">清空日志</button>
     <div id="log" class="log" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑧ 一键演示：含逗号编号的两个会话分别发布（键冲突修复）</h2>
+    <p class="muted" style="font-size:12.5px;margin-top:0;">
+      旧规则把单事件会话 <span class="pill">["a,b"]</span> 与双事件会话
+      <span class="pill">["a","b"]</span> 算成同一个键，后者满足发布条件也可能漏发。
+      本演示让同一用户的这两个会话各自取得独立键，并按两次 watermark 分别发布，
+      新增/撤回明细都保留完整、按原顺序的编号。
+    </p>
+    <button onclick="runCommaDemo()">▶ 运行逗号编号演示</button>
+    <div id="commaLog" class="log" style="margin-top:12px;"></div>
   </div>
 </main>
 
@@ -249,9 +262,9 @@ async function refreshAll() {
   $('cfgLine').innerHTML = `user=<b>${cfg.user_id}</b> · idle_gap=<b>${cfg.idle_gap_seconds}s</b> · watermark=<b>${shortTs(cfg.watermark)}</b>`;
 
   $('sessionsBox').innerHTML = sessions.length ? `<table><thead><tr><th>状态</th><th>开始</th><th>结束</th><th>事件</th><th>key</th></tr></thead><tbody>
-    ${sessions.map(s=>`<tr><td><span class="badge ${s.status}">${s.status}</span></td>
+    ${sessions.map(s=>`<tr><td><span class="badge ${s.status}">${s.status}</span>${s.ids_need_review?' <span class="badge review">待核对</span>':''}</td>
       <td class="mono">${shortTs(s.start_time)}</td><td class="mono">${shortTs(s.end_time)}</td>
-      <td class="ids">${s.event_ids.join(', ')}</td><td class="pill">${s.session_key}</td></tr>`).join('')}</tbody></table>`
+      <td class="ids">${s.event_ids.length ? s.event_ids.join(', ') : '<span class="muted">（旧编号无法拆回，待核对）</span>'}</td><td class="pill">${s.session_key}</td></tr>`).join('')}</tbody></table>`
     : '<p class="muted">暂无会话</p>';
 
   $('eventsBox').innerHTML = events.length ? `<table><thead><tr><th>event_id</th><th>event_time (UTC)</th></tr></thead><tbody>
@@ -263,7 +276,7 @@ async function refreshAll() {
       <td class="mono">${r.revision_no}</td>
       <td><span class="badge ${r.reason}">${r.reason}</span></td>
       <td class="mono">${shortTs(r.watermark)}</td>
-      <td>${r.changes.map(c=>`<span class="badge ${c.change_type}">${c.change_type} ${c.event_ids.length}事件</span>`).join(' ') || '<span class="muted">—</span>'}</td>
+      <td>${r.changes.map(c=>`<span class="badge ${c.change_type}">${c.change_type} ${c.event_ids.length}事件${c.ids_need_review?' · 待核对':''}</span>`).join(' ') || '<span class="muted">—</span>'}</td>
       <td class="muted">${r.detail||''}</td></tr>`).join('')}</tbody></table>`
     : '<p class="muted">暂无修订</p>';
 }
@@ -280,14 +293,14 @@ async function openRevision(no) {
     </div>
     <h3 style="font-size:13px;color:var(--muted);">差异（撤回 / 新增）</h3>
     ${r.changes.length ? `<table><thead><tr><th>类型</th><th>会话</th><th>时间范围</th><th>事件</th></tr></thead><tbody>
-      ${r.changes.map(c=>`<tr><td><span class="badge ${c.change_type}">${c.change_type}</span></td>
+      ${r.changes.map(c=>`<tr><td><span class="badge ${c.change_type}">${c.change_type}</span>${c.ids_need_review?' <span class="badge review">待核对</span>':''}</td>
         <td class="pill">${c.session_key}</td><td class="mono">${shortTs(c.start_time)} ~ ${shortTs(c.end_time)}</td>
-        <td class="ids">${c.event_ids.join(', ')}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">本修订无发布差异</p>'}
+        <td class="ids">${c.event_ids.length ? c.event_ids.join(', ') : '<span class="muted">（旧编号无法拆回，待核对）</span>'}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">本修订无发布差异</p>'}
     <h3 style="font-size:13px;color:var(--muted);margin-top:16px;">该修订下的完整会话快照</h3>
     <table><thead><tr><th>状态</th><th>开始</th><th>结束</th><th>事件</th></tr></thead><tbody>
-    ${r.sessions.map(s=>`<tr><td><span class="badge ${s.status}">${s.status}</span></td>
+    ${r.sessions.map(s=>`<tr><td><span class="badge ${s.status}">${s.status}</span>${s.ids_need_review?' <span class="badge review">待核对</span>':''}</td>
       <td class="mono">${shortTs(s.start_time)}</td><td class="mono">${shortTs(s.end_time)}</td>
-      <td class="ids">${s.event_ids.join(', ')}</td></tr>`).join('')}</tbody></table>`;
+      <td class="ids">${s.event_ids.length ? s.event_ids.join(', ') : '<span class="muted">（旧编号无法拆回，待核对）</span>'}</td></tr>`).join('')}</tbody></table>`;
   $('modalBg').style.display='flex';
 }
 const closeModal = () => $('modalBg').style.display='none';
@@ -341,6 +354,44 @@ async function runFullDemo() {
     flash('完整演示执行完毕，请查看修订历史（可点击）与日志','ok');
   } catch (e) {
     log('演示失败: ' + e.message, 'err'); flash(e.message);
+  }
+}
+
+// ---------- 一键逗号编号演示 ----------
+async function runCommaDemo() {
+  clearFlash();
+  const box = $('commaLog');
+  box.textContent = '';
+  const clog = (msg, cls='') => { box.innerHTML += (cls?`<span class="${cls}">`:'>')+msg.replace(/&/g,'&amp;').replace(/</g,'&lt;')+(cls?'</span>':'')+'\n'; box.scrollTop=box.scrollHeight; };
+  const uid = 'demo-comma-' + Date.now().toString(36);
+  try {
+    clog('用户 ' + uid + '，idle_gap=600s；事件 "a,b"@10:00 与 "a"@10:20、"b"@10:22 间隔 >10 分钟，属于两个会话', 'info');
+    await api(`/api/users/${uid}/config`, {method:'PUT', body:JSON.stringify({idle_gap_seconds:600})});
+    const r = await api('/api/events/import', {method:'POST', body:JSON.stringify({events:[
+      {user_id:uid, event_id:'a,b', event_time:'2026-11-22T10:00:00Z'},
+      {user_id:uid, event_id:'a',   event_time:'2026-11-22T10:20:00Z'},
+      {user_id:uid, event_id:'b',   event_time:'2026-11-22T10:22:00Z'}
+    ]})});
+    const [s1, s2] = r.pending;
+    clog(`会话化得到 ${r.pending.length} 个会话：[${s1.event_ids.join(' | ')}] key=${s1.session_key}；[${s2.event_ids.join(' | ')}] key=${s2.session_key}`);
+    if (s1.session_key === s2.session_key) { clog('错误：两个会话仍共用同一个键！', 'err'); return; }
+    clog('两个会话键不同 —— 旧规则下此处会冲突，现在已修复。', 'ok');
+
+    const p1 = await api('/api/watermark/advance', {method:'POST', body:JSON.stringify({user_id:uid, watermark:'2026-11-22T10:12:00Z'})});
+    clog(`watermark→10:12（修订 #${p1.new_revision_no}）：发布 ${p1.changes.map(c=>`[${c.event_ids.join(' | ')}] key=${c.session_key}`).join('；')}；剩余 pending=${p1.pending.length}`, 'info');
+    if (p1.pending.length !== 1) { clog('错误：第二个会话不应在此时发布', 'err'); return; }
+
+    const p2 = await api('/api/watermark/advance', {method:'POST', body:JSON.stringify({user_id:uid, watermark:'2026-11-22T10:34:00Z'})});
+    clog(`watermark→10:34（修订 #${p2.new_revision_no}）：发布 ${p2.changes.map(c=>`[${c.event_ids.join(' | ')}] key=${c.session_key}`).join('；')}`, 'info');
+    const keys = p2.published.map(s => s.session_key);
+    const ids = p2.published.map(s => `[${s.event_ids.join(' | ')}]`);
+    clog(`最终 published=${p2.published.length}：${ids.join(' 和 ')}，两个键互不相同（${new Set(keys).size} 个独立键），编号完整且有序。`, 'ok');
+
+    $('userId').value = uid;
+    await loadUser();
+    flash('逗号编号演示完成：两个会话已分别发布，可在修订历史中查看完整编号', 'ok');
+  } catch (e) {
+    clog('演示失败: ' + e.message, 'err'); flash(e.message);
   }
 }
 

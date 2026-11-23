@@ -1,8 +1,9 @@
 """End-to-end smoke test against a running server (not pytest)."""
 import json
+import os
 import urllib.request
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("SMOKE_BASE_URL", "http://127.0.0.1:8000")
 
 
 def call(method, path, body=None):
@@ -98,8 +99,39 @@ s, cur = call("GET", f"/api/users/{U}/sessions")
 print("current sessions:", [(x["status"], x["event_ids"]) for x in cur])
 assert len(cur) == 1 and cur[0]["status"] == "published"
 
+# ---------------- comma-in-event-id: two sessions must publish separately
+UC = "smoke-comma"
+print("\nset gap (comma user):", call("PUT", f"/api/users/{UC}/config", {"idle_gap_seconds": 600})[0])
+s, r = imp(UC, [
+    ("a,b", "2026-11-22T10:00:00Z"),
+    ("a", "2026-11-22T10:20:00Z"),
+    ("b", "2026-11-22T10:22:00Z"),
+])
+print("comma import:", s, "pending:", [(p["event_ids"], p["session_key"]) for p in r["pending"]])
+assert s == 200 and len(r["pending"]) == 2
+k_single, k_double = (p["session_key"] for p in r["pending"])
+assert k_single != k_double, '["a,b"] and ["a","b"] must not share a key'
+assert r["pending"][0]["event_ids"] == ["a,b"]
+assert r["pending"][1]["event_ids"] == ["a", "b"]
+
+# first watermark publishes only the single-event session
+s, r = wm(UC, "2026-11-22T10:12:00Z")
+print("comma wm1012:", r["new_revision_no"], [(c["change_type"], c["event_ids"]) for c in r["changes"]])
+assert r["new_revision_no"] == 1
+assert r["changes"][0]["event_ids"] == ["a,b"]
+assert len(r["published"]) == 1 and len(r["pending"]) == 1
+
+# second watermark publishes the two-event session with its own key
+s, r = wm(UC, "2026-11-22T10:34:00Z")
+print("comma wm1034:", r["new_revision_no"], [(c["change_type"], c["event_ids"]) for c in r["changes"]])
+assert r["new_revision_no"] == 2
+assert r["changes"][0]["event_ids"] == ["a", "b"]
+assert len({x["session_key"] for x in r["published"]}) == 2
+assert {tuple(x["event_ids"]) for x in r["published"]} == {("a,b",), ("a", "b")}
+
 with urllib.request.urlopen(BASE + "/", timeout=10) as r:
     html = r.read().decode()
 assert "事件会话发布" in html
+assert "runCommaDemo" in html
 print("index page bytes:", len(html))
 print("\nALL SMOKE CHECKS PASSED")

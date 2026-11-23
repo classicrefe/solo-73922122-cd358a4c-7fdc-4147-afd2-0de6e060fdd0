@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.models import fmt_ts
+from app.models import decode_event_ids, fmt_ts
 
 
 class AwareDatetimeMixin:
@@ -36,6 +36,7 @@ class SessionOut(BaseModel):
     end_time: str
     event_count: int
     event_ids: list[str]
+    ids_need_review: bool = False
     status: Literal["published", "pending"]
 
 
@@ -46,6 +47,7 @@ class ChangeOut(BaseModel):
     end_time: str
     event_count: int
     event_ids: list[str]
+    ids_need_review: bool = False
 
 
 class RevisionOut(BaseModel):
@@ -106,24 +108,32 @@ class EventOut(BaseModel):
 
 
 def serialize_session(snap) -> SessionOut:
+    ids, need_review = decode_event_ids(
+        snap.event_ids, snap.event_count, snap.id_encoding
+    )
     return SessionOut(
         session_key=snap.session_key,
         start_time=fmt_ts(snap.start_time),
         end_time=fmt_ts(snap.end_time),
         event_count=snap.event_count,
-        event_ids=snap.event_ids.split(","),
+        event_ids=ids,
+        ids_need_review=need_review,
         status=snap.status,  # type: ignore[arg-type]
     )
 
 
 def serialize_change(ch) -> ChangeOut:
+    ids, need_review = decode_event_ids(
+        ch.event_ids, ch.event_count, ch.id_encoding
+    )
     return ChangeOut(
         change_type=ch.change_type,  # type: ignore[arg-type]
         session_key=ch.session_key,
         start_time=fmt_ts(ch.start_time),
         end_time=fmt_ts(ch.end_time),
         event_count=ch.event_count,
-        event_ids=ch.event_ids.split(","),
+        event_ids=ids,
+        ids_need_review=need_review,
     )
 
 
